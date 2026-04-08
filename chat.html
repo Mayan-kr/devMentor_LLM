@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>devMentor – Local Chat</title>
+  <title>devMentor – Local Chat (Created by Mayan)</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/styles/github-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/highlight.min.js"></script>
   <style>
     * { box-sizing: border-box; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 
@@ -60,7 +63,30 @@
       border-radius: 10px;
       font-size: 14px;
       line-height: 1.4;
-      white-space: pre-wrap;
+      white-space: normal;
+      word-wrap: break-word;
+    }
+
+    .message pre {
+      background: #0d1117;
+      border-radius: 6px;
+      padding: 12px;
+      overflow-x: auto;
+      margin: 8px 0;
+    }
+
+    .message code {
+      font-family: ui-monospace, Menlo, Monaco, "Cascadia Mono", "Segoe UI Mono", monospace;
+      font-size: 13px;
+    }
+
+    .message p {
+      margin-top: 0;
+      margin-bottom: 0.5em;
+    }
+
+    .message p:last-child {
+      margin-bottom: 0;
     }
 
     .user {
@@ -140,34 +166,53 @@
   </div>
 
   <script>
-    const API_URL = "http://127.0.0.1:8000/chat";
+    const API_URL_STREAM = "http://127.0.0.1:8000/chat_stream";
 
     const chatEl = document.getElementById("chat");
     const promptEl = document.getElementById("prompt");
     const sendBtn = document.getElementById("sendBtn");
     const statusEl = document.getElementById("status");
 
-    function addMessage(text, role) {
+    let chatHistory = JSON.parse(localStorage.getItem('devMentorChat')) || [];
+
+    function addMessageDiv(role) {
       const div = document.createElement("div");
       div.classList.add("message", role === "user" ? "user" : "assistant");
-      div.textContent = text;
       chatEl.appendChild(div);
-      chatEl.scrollTop = chatEl.scrollHeight;
+      return div;
     }
+    
+    // Initial Load
+    chatHistory.forEach(msg => {
+       const div = addMessageDiv(msg.role);
+       if (msg.role === "user") {
+           div.textContent = msg.text;
+       } else {
+           div.innerHTML = marked.parse(msg.text);
+           div.querySelectorAll('pre code').forEach((block) => {
+              hljs.highlightElement(block);
+           });
+       }
+    });
+    chatEl.scrollTop = chatEl.scrollHeight;
 
     async function sendMessage() {
       const text = promptEl.value.trim();
       if (!text) return;
 
-      addMessage(text, "user");
+      // Add user message
+      const userDiv = addMessageDiv("user");
+      userDiv.textContent = text;
+      chatHistory.push({ role: "user", text: text });
+      
       promptEl.value = "";
       promptEl.focus();
 
       sendBtn.disabled = true;
-      statusEl.textContent = "Thinking...";
+      statusEl.textContent = "Generating...";
 
       try {
-        const res = await fetch(API_URL, {
+        const res = await fetch(API_URL_STREAM, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -176,13 +221,41 @@
           }),
         });
 
-        if (!res.ok) {
-          throw new Error("HTTP " + res.status);
-        }
+        if (!res.ok) throw new Error("HTTP " + res.status);
 
-        const data = await res.json();
-        addMessage(data.response || "(no response)", "assistant");
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        
+        let assistantText = "";
+        const assistantDiv = addMessageDiv("assistant");
+        
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          
+          const lines = chunk.split("\n");
+          for (let line of lines) {
+             if (line.startsWith("data: ")) {
+                 const data = line.replace("data: ", "");
+                 if (data === "[DONE]") break;
+                 try {
+                     const parsed = JSON.parse(data);
+                     assistantText += parsed.text;
+                     assistantDiv.innerHTML = marked.parse(assistantText);
+                     assistantDiv.querySelectorAll('pre code').forEach((block) => {
+                        hljs.highlightElement(block);
+                     });
+                     chatEl.scrollTop = chatEl.scrollHeight;
+                 } catch (e) { }
+             }
+          }
+        }
+        
         statusEl.textContent = "";
+        chatHistory.push({ role: "assistant", text: assistantText });
+        localStorage.setItem('devMentorChat', JSON.stringify(chatHistory));
+        
       } catch (err) {
         console.error(err);
         statusEl.textContent = "Error talking to devMentor. Is the server running?";

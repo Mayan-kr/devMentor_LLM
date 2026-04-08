@@ -1,8 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import threading
+import json
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TextIteratorStreamer
 from peft import PeftModel
 
 BASE_MODEL_ID = "deepseek-ai/deepseek-coder-1.3b-instruct"
@@ -28,12 +31,7 @@ base_model = AutoModelForCausalLM.from_pretrained(
 print("Loading devMentor LoRA adapter...")
 model = PeftModel.from_pretrained(base_model, LORA_PATH)
 
-# 🔥 Merge LoRA into the base model so inference always uses fine-tuned weights
-try:
-    model = model.merge_and_unload()
-except Exception as e:
-    # If merge isn't supported for some reason, at least ensure eval() is set
-    print(f"Warning: could not merge LoRA: {e}")
+# 🔥 Skip full merge since we are in 4-bit; using PeftModel wrapper directly is safer for inference
 model.eval()
 
 app = FastAPI(
@@ -128,5 +126,60 @@ def chat(req: ChatRequest):
 
     return {"response": cleaned}
 
+@app.post("/chat_stream")
+async def chat_stream(req: ChatRequest):
+    prompt = build_prompt(req.query)
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
 
+    generation_kwargs = dict(
+        **inputs,
+        max_new_tokens=req.max_new_tokens,
+        do_sample=False,
+        temperature=0.1,
+        top_p=0.9,
+        streamer=streamer,
+    )
+
+    thread = threading.Thread(target=model.generate, kwargs=generation_kwargs)
+    thread.start()
+
+    def event_stream():
+        buffer = ""
+        stop_tags = ["<user>", "</assistant>", "<system>", "\n<"]
+        for new_text in streamer:
+            buffer += new_text
+            
+            # Watch for generation stop tags assembling in the buffer
+            stop_found = False
+            for tag in stop_tags:
+                if tag in buffer:
+                    idx = buffer.find(tag)
+                    clean_text = buffer[:idx]
+                    if clean_text:
+                        yield f"data: {json.dumps({'text': clean_text})}\n\n"
+                    stop_found = True
+                    break
+            
+            if stop_found:
+                buffer = ""
+                break
+                
+            # Safely yield buffer but keep the last 15 chars in case a tag is forming
+            if len(buffer) > 15:
+                yield f"data: {json.dumps({'text': buffer[:-15]})}\n\n"
+                buffer = buffer[-15:]
+                
+        # Flush the rest of the buffer
+        if buffer:
+            for tag in stop_tags:
+                if tag in buffer:
+                    buffer = buffer[:buffer.find(tag)]
+            if buffer.strip():
+                yield f"data: {json.dumps({'text': buffer})}\n\n"
+        
+        # Signal completion
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
